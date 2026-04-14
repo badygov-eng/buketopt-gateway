@@ -1,0 +1,11 @@
+services:
+  gateway:
+    build: .
+    image: buketopt-gateway:local
+    ports:
+      - "127.0.0.1:8600:8600"
+    environment:
+      GATEWAY_API_KEYS: ${GATEWAY_API_KEYS:-dev-change-me}
+      GATEWAY_BITRIX_BASE_URL: ${GATEWAY_BITRIX_BASE_URL:-https://ai-test.buketopt.ru}
+      GATEWAY_BITRIX_VERIFY_TLS: ${GATEWAY_BITRIX_VERIFY_TLS:-false}
+      GATEWAY_DEFAULT_PAYMENT_METHOD_ID: ${GATEWAY_DEFAULT_PAYMENT_METHOD_ID:-15}
