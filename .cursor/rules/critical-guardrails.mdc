@@ -1,0 +1,66 @@
+---
+description: Critical safety guardrails, deploy rules, forbidden actions
+alwaysApply: true
+---
+
+## КРИТИЧНО: ДЕПЛОЙ НА PROD
+
+> ИНЦИДЕНТ 19.12.2024: Потеря данных из-за деплоя без подтверждения!
+
+**НИКОГДА без явного "ДА, ДЕПЛОЙ":**
+- Запуск канонических деплой-скриптов проекта (`office-mcp-servers/deploy.sh`, `services/<svc>/scripts/deploy-prod.sh`, `rsync` на prod)
+- SSH команды на prod
+- Изменения prod БД
+
+"сохрани"/"обнови"/"запусти" ≠ деплой → Уточнить окружение.
+Перед деплоем: показать чеклист → дождаться "ДА, ДЕПЛОЙ" → запустить канонический деплой-скрипт проекта (`office-mcp-servers/deploy.sh` или `services/<svc>/scripts/deploy-prod.sh`; см. `deploy-safety.mdc`).
+
+### Маппинг проект → сервер (обязательно проверять)
+
+| Проект | Сервер | SSH alias | Путь |
+|--------|--------|-----------|------|
+| office-mcp-servers | main-server (**primary:** `main-server.tail0840bc.ts.net`; **break-glass IP:** см. SERVER_HOSTS.md) | `yc-vm` (`HostName` → tailnet в `~/.ssh/config`) | `/opt/office-mcp-servers` |
+| llm-proxy | llm-proxy (**primary:** `llm-proxy.tail0840bc.ts.net`; **break-glass IP:** см. SERVER_HOSTS.md) | `llm-proxy` | `/opt/llm-proxy` |
+
+Правило: перед деплоем сверять `scripts/projects.conf` + `SERVER_HOSTS.md`.
+ЗАПРЕЩЕНО деплоить что-либо на `llm-proxy`, кроме самого `llm-proxy`.
+
+**Штатный прод для office-mcp-servers:** только workflow **`office-mcp-deploy.yml`** (GitHub Environments / CD), режимы **`compose-pull`** / **`quick-pull`** (`--pull-deploy`). Образы собираются в **`office-mcp-images.yml`** (GHCR); digest pins попадают в **`office-mcp-servers/config/profile-mapping.json`** через **`office-mcp-digest-pin-bot.yml`**.
+
+**Локальный `office-mcp-servers/deploy.sh`** против production SSH target (**`main-server`**, **`yc-vm`**, **`*.tail0840bc.ts.net`**) **не выполняет `docker compose build`** — функция **`build_services`** завершается с ошибкой (`scripts/lib/deploy_target.sh`, `is_production_target`). Обновление контейнеров на prod только через **`pull`** (`deploy.sh … --pull-deploy` или CD). Откат ошибочного pin: **`git revert`** digest-pin PR → снова **`compose-pull`**. SSH/rsync/deploy script на prod без явного **«ДА, ДЕПЛОЙ»** по-прежнему запрещены правилами выше.
+
+## Forbidden
+
+- Порты вне диапазона проекта
+- Публичные БД (Redis, PostgreSQL)
+- Хардкод секретов → `~/.secrets/`
+- Cloudflare Proxy в РФ (блокируется!)
+- Хардкод IP → SERVER_HOSTS.md
+- rsync БЕЗ --exclude для user-generated content
+- `docker compose down -v` без бэкапа и подтверждения
+- `docker volume rm` / `docker volume prune` без бэкапа
+- docker-compose `ports:` маппинг для портов, которые сервис не слушает (мёртвый маппинг)
+- Прямые API к Claude/OpenAI/Gemini из кода проектов → только через **OpenRouter** или **LLM Proxy**. Прямые API-ключи провайдеров в env проектов **запрещены** (кроме конфигов LiteLLM на llm-proxy VPS и специализированного пути OpenClaw — см. `.cursor/rules/llm-access.mdc` и `litellm-proxy-mandatory.mdc`).
+- Вызывать `fal.run` напрямую с локального ПК
+- Копировать `.session` файлы Telegram на сервер
+- Один Telegram Bot Token на DEV и PROD
+- Хардкод паролей в docker-compose.yml или коде
+- Поднимать YC bucket quota без одновременного rsync обновлённого `backup-retention-prune.service` (он должен иметь `restic unlock --remove-all` перед prune, иначе stale-lock не уберётся)
+
+## Required
+
+- Порт из диапазона проекта
+- Docker: 127.0.0.1 only
+- Секреты: `~/.secrets/{project}/`
+- Каждый проект: задачи в GitHub Issues по умолчанию (Atlas Day-8); Yandex Tracker опционально (legacy — см. `yandex-tracker.mdc`)
+- Каждый веб-сервис: `/health` endpoint
+- Каждая новая функция: тесты (unit + error cases)
+- HTTP запросы: timeout обязателен
+- FastAPI endpoints: try/except с логированием
+- Type hints для всех функций
+- Connection pooling для БД
+- Systemd: `Restart=always` (не on-failure)
+- Docker build: `--platform linux/amd64` для деплоя
+- CI/CD workflow для каждого проекта
+- Перед Docker-деплоем на VPS: `ss -tlnp` проверка портов на конфликты с systemd
+- Бакеты под restic — обязательно мониторинг размера через `restic-bucket-size-alert.timer`; deny на quota без alerting = инцидент

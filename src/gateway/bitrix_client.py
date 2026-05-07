@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, cast
+from typing import Any
 
 import httpx
 
@@ -62,9 +62,11 @@ class BitrixClient:
         if not isinstance(data, dict):
             raise BitrixRestError("session/get: missing data object")
         sess = data.get("session")
-        if not sess or not isinstance(sess, str):
+        if not isinstance(sess, str):
             raise BitrixRestError("session/get: missing data.session")
-        return cast(str, sess)
+        if not sess:
+            raise BitrixRestError("session/get: missing data.session")
+        return sess
 
     async def add_to_basket(
         self,

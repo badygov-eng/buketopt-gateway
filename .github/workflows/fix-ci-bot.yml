@@ -1,0 +1,154 @@
+# Atlas Day-60 — auto-fix safe CI failures on PR branches (ruff / eof / ws via pre-commit).
+name: fix-ci-bot (Atlas Day-60)
+
+on:
+  workflow_run:
+    # `workflow_run.workflows` must list workflow display names explicitly (no wildcards).
+    # Keep in sync with `name:` in each `.github/workflows/*.yml` (omit this file — avoid self-trigger).
+    workflows:
+      - "Antifragility"
+      - "Atlas Weekly Dashboard"
+      - "Atlas-9 KPI weekly"
+      - "Auto deploy Office MCP digest pins"
+      - "Auto-deploy trigger (Atlas Day-62)"
+      - "Auto-label trusted bot PRs"
+      - "Auto-merge pre-approved PRs"
+      - "Auto-merge trivia PRs"
+      - "Branch cleanup weekly"
+      - "CD drift checks"
+      - "Chaos-light"
+      - "Cloud Agent advisory — bug triage (Sentry)"
+      - "Cloud Agent advisory — docs update"
+      - "Cloud Agent advisory — navigation comments"
+      - "Cloud Agent advisory — test scaffold"
+      - "Cursor M3 audits (Cloud Agents API v1)"
+      - "DAST (OWASP ZAP baseline)"
+      - "LLM Proxy Deploy"
+      - "LLM Proxy nginx image"
+      - "Lint workflow permissions (Day-64)"
+      - "LiteLLM YC Deploy"
+      - "LiteLLM YC image"
+      - "Load test (Locust)"
+      - "MCP CI"
+      - "Matrix MCP HTTP smoke"
+      - "Migration test on prod snapshot (Atlas Day-61)"
+      - "Office MCP Deploy"
+      - "Office MCP Deploy Preflight"
+      - "Office MCP base image"
+      - "Office MCP canon"
+      - "Office MCP digest pin bot"
+      - "Office MCP images"
+      - "Office MCP tools image"
+      - "OpenClaw Deploy"
+      - "PR Labeler"
+      - "Post-merge branch cleanup"
+      - "Prod-critical smoke suite"
+      - "Security (Tier 2)"
+      - "Security container-iac (weekly)"
+      - "Security — Gitleaks (always-run)"
+      - "Self-hosted runner smoke"
+      - "Stale (Atlas-7)"
+      - "Tailscale Connectivity Validation"
+      - "VPN Service CI"
+      - "VPN Service Deploy"
+      - "VPN Service image"
+      - "Weekly backup restorability"
+      - "audit-docs-canon"
+      - "auto-index"
+      - "coverage-ratchet"
+      - "jscpd-check"
+      - "jscpd-cross-repo"
+      - "repos-index-sync"
+      - "restic prune self-heal (dry-run)"
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to fix"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# When MCP CI and Office MCP canon both fail on the same push, GitHub starts two workflow_run
+# listeners; without this, two fix-ci jobs could race on push to the PR branch.
+concurrency:
+  group: >-
+    ${{ github.event_name == 'workflow_dispatch' && format('fix-ci-manual-{0}', github.event.inputs.pr_number) || format('fix-ci-{0}', github.event.workflow_run.head_sha) }}
+  cancel-in-progress: true
+
+jobs:
+  fix-ci:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'failure' &&
+       github.event.workflow_run.head_branch != 'main' &&
+       github.event.workflow_run.name != 'fix-ci-bot (Atlas Day-60)' &&
+       (github.event.workflow_run.event == 'pull_request' ||
+        github.event.workflow_run.event == 'push'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+      actions: read
+    steps:
+      - name: Resolve PR number
+        id: resolve_pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PR="${{ github.event.inputs.pr_number }}"
+          else
+            # Primary: workflow_run payload (works for default-branch-head PRs only).
+            PR=$(jq -r '.workflow_run.pull_requests[0].number // empty' "$GITHUB_EVENT_PATH")
+            if [ -z "${PR}" ]; then
+              # Fallback 1: resolve by head_branch via gh API (handles GitHub bug —
+              # workflow_run.pull_requests is empty for most PRs).
+              HEAD_BRANCH=$(jq -r '.workflow_run.head_branch // empty' "$GITHUB_EVENT_PATH")
+              HEAD_SHA=$(jq -r '.workflow_run.head_sha // empty' "$GITHUB_EVENT_PATH")
+              if [ -n "${HEAD_BRANCH}" ]; then
+                # PR open on this branch. We try open first, then any (closed PRs we don't fix).
+                PR=$(gh pr list --repo "${REPO}" --head "${HEAD_BRANCH}" --state open --json number --jq '.[0].number // empty' 2>/dev/null || true)
+                if [ -n "${PR}" ]; then
+                  echo "Resolved PR via head_branch fallback: #${PR} (branch=${HEAD_BRANCH})"
+                fi
+              fi
+              if [ -z "${PR}" ] && [ -n "${HEAD_SHA}" ]; then
+                # Fallback 2: search by commit SHA (covers force-pushed branches).
+                PR=$(gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" --jq '.[] | select(.state == "open") | .number' 2>/dev/null | head -1 || true)
+                if [ -n "${PR}" ]; then
+                  echo "Resolved PR via head_sha fallback: #${PR} (sha=${HEAD_SHA})"
+                fi
+              fi
+              if [ -z "${PR}" ]; then
+                echo "No open PR found for head_branch=${HEAD_BRANCH} sha=${HEAD_SHA} — skip"
+                echo "pr=" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+          fi
+          echo "pr=${PR}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        if: steps.resolve_pr.outputs.pr != ''
+        with:
+          ref: refs/pull/${{ steps.resolve_pr.outputs.pr }}/head
+          fetch-depth: 0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        if: steps.resolve_pr.outputs.pr != ''
+        with:
+          python-version: "3.11"
+      - name: Install tools
+        if: steps.resolve_pr.outputs.pr != ''
+        run: pip install ruff pyyaml pre-commit
+      - name: Run fix-ci-bot
+        if: steps.resolve_pr.outputs.pr != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python3 scripts/atlas/fix_ci_bot.py --pr "${{ steps.resolve_pr.outputs.pr }}"

@@ -1,0 +1,206 @@
+---
+description: Canonical decisions for Atlas — owner, visibility, GitHub flow, branch protection, quality gates
+alwaysApply: true
+---
+
+# Atlas canon
+
+Канонические решения для всех проектов Atlas. Решения здесь — **source of truth** для агента в каждом промте. Варьировать только через ADR в `MCP/docs/ADR/`.
+
+См. `MCP/ATLAS.md` для общего roadmap и `MCP/templates/atlas-project/` для реализации.
+
+## GitHub
+
+- **Owner**: `badygov-eng` (org). Никаких личных аккаунтов, ENV-override или вариаций per-project. Один владелец → одна точка контроля прав, секретов, audit log.
+- **Visibility**: `private` по умолчанию **всегда**. `public` только через явный ADR с обоснованием.
+- **Default flow**: local-first. `scripts/atlas/new_project.sh <name> <cluster>` создаёт локальный проект; `--github` (Day-3.3+) опционально пушит в org **после ручного review** `.env.example` и `.gitignore`.
+
+## Branch protection (main)
+
+Минимальный набор для solo-dev (без require reviews — нет ревьюверов):
+
+```
+required_status_checks: ["ci"]
+allow_force_pushes:    false
+allow_deletions:       false
+enforce_admins:        false
+require_pull_request_reviews: false  # solo dev
+```
+
+Применяется автоматически при `--github` (Day-3.3) и проверяется audit'ом (Atlas-1.5).
+
+## Quality gates (обязательны)
+
+Все новые и мигрированные проекты должны иметь:
+
+- `.pre-commit-config.yaml` с: **gitleaks**, **bandit**, **ruff**, **mypy**, conventional commits.
+- **CI coverage** (через `.github/workflows/*.yml`):
+  - lint step (ruff)
+  - test step (pytest)
+  - gitleaks step
+
+  Convention: новые проекты — единый `ci.yml`. Legacy — допускается multi-workflow (`ci.yml` + `gitleaks.yml`). Canon валидирует **покрытие**, а не структуру файлов. См. [`docs/ADR/2026-05-04-coverage-based-ci-canon.md`](../../docs/ADR/2026-05-04-coverage-based-ci-canon.md).
+- Во всех workflows обязателен top-level `permissions:`; `write-all` / `read-all` запрещены; audit через `scripts/atlas/lint_workflow_permissions.py` и `scripts/atlas/wf_permissions_allowlist.yml` (см. [docs/PLAYBOOKS/workflow-permissions.md](../../docs/PLAYBOOKS/workflow-permissions.md)).
+- `.cursor/rules/discovery.mdc` — в YAML frontmatter включён alwaysApply (discovery-before-implementation).
+- `.cursor/rules/cold-start.mdc` — в YAML frontmatter включён alwaysApply (cold-start для возврата через 4 месяца).
+- `AGENTS.md` с pointer на `MCP/ATLAS.md`.
+- `docs/INDEX.md` — каталог документации.
+- `docs/ADR/` — обоснование архитектурных решений.
+- `docs/MIGRATIONS/` и `docs/MIGRATIONS/completed/` — playbooks для cross-repo миграций (см. Atlas-2.1, ADR [`2026-05-04-migration-discipline-canon.md`](../../docs/ADR/2026-05-04-migration-discipline-canon.md)). Регистрация в [`MCP/MIGRATIONS_REGISTRY.md`](../../MIGRATIONS_REGISTRY.md).
+- Регистрация в [`MCP/REPOS_INDEX.md`](../../REPOS_INDEX.md) (Atlas-2.2): новый репо = PR с строкой в `Active repositories`.
+
+
+## Branch hygiene (Atlas-7)
+
+Канон гигиены веток. Solo-dev темп: 5–15 PR/day → stale ветки/PR накапливаются быстро.
+
+### Active branches
+
+- **1 ветка ↔ 1 активный PR**. После merge ветка удаляется автоматически (`delete_branch_on_merge: true`).
+- При **close без merge** ветка удаляется вручную в течение **24h** (`gh pr close --delete-branch` или `git push origin --delete <branch>`).
+
+### Stale thresholds
+
+
+Пороги **3/7 days** (а не 5/10): при темпе 5–15 PR/day даже «мягкие» 5/10 мало что решают; более жёсткие **3 дня** на предупреждение и **7 дней** на auto-close совпадают с реальной скоростью solo-dev. Риск закрыть PR после паузы (выходные, отпуск) снимается меткой **`keep-open`** — явный escape hatch; опускаться ниже 3 дней нельзя (иначе сметёт нормальные короткие паузы).
+
+| Объект | Threshold | Действие |
+|---|---|---|
+| Branch без open PR + нет коммитов | **3 days** | Кандидат на `git push origin --delete` |
+| Open PR без активности (commits, comments, reviews) | **3 days** | Stale warning (label `stale` + bot comment) |
+| Open PR без активности | **7 days** | Auto-close через GitHub Actions stale workflow |
+
+### Auto-cleanup
+
+- **`cursor/*` branches** (Cloud Agent auto-branches, не превратившиеся в PR за **3 days**) — удаляются автоматически.
+- **`chore/wip-local-*`** — WIP snapshot, не публиковать на remote (только локально). Если попал на remote, удалить.
+- **`chore/office-mcp-digest-pin-*`** — bot-managed, оставляется только самый свежий, остальные закрываются при следующем pin update.
+- **Trusted bot PRs** (Dependabot patch/minor, `cursor[bot]`) auto-labeled **`auto-deploy`** via `.github/workflows/auto-label-dependabot.yml`. Major dep updates need human label **`dependabot-major-ok`** (or manual `auto-deploy`).
+
+### Workflow
+
+Реализация:
+- `.github/workflows/stale.yml` — actions/stale@5bef64f19d7facfb25b37b414482c7164d639639 (v9) для labels + auto-close (Atlas-7).
+- `.github/workflows/branch-cleanup-weekly.yml` — Sunday 02:00 UTC, `scripts/atlas/cleanup_stale_branches.sh --apply` (расширенный sweep: `cursor/*`, `dependabot/*`, `chore/atlas-9-kpi-weekly*`, `chore/wip-local-*`).
+- `scripts/atlas/branch_cleanup.sh` — локальный узкий аудит (`cursor/*`, `chore/wip-local-*`).
+
+См. ADR `2026-05-06-branch-hygiene-canon.md`.
+
+
+## Connectivity canon (Atlas-8)
+
+> Добавлено 2026-05-06 после reset-инцидента: agents предполагали connectivity, не проверяли, не имели fallback (gh TLS timeout, нет доступа к ВМ, агент не знал какой SSH alias использовать). ADR: [`2026-05-06-pr-workflow-reset-canon.md`](../../docs/ADR/2026-05-06-pr-workflow-reset-canon.md).
+
+### Принцип: probe before action
+
+**Перед** любым действием с remote service (GitHub API, SSH на VM, прямые HTTP к прод-сервису, прод БД) — короткий **health probe (≤10s timeout)**.
+
+```bash
+# GitHub
+gh api user --jq .login || { echo "GH unreachable"; exit 1; }
+
+# Tailscale + SSH (primary)
+ssh -o ConnectTimeout=10 -o BatchMode=yes -q deploy@main-server.tail0840bc.ts.net true \
+  || { echo "main-server SSH unreachable via Tailscale"; }
+
+# llm-proxy
+ssh -o ConnectTimeout=10 -o BatchMode=yes -q deploy@llm-proxy.tail0840bc.ts.net true \
+  || { echo "llm-proxy SSH unreachable"; }
+
+# HTTPS endpoint
+curl -fsSL --max-time 10 https://<host>/health || echo "endpoint down"
+```
+
+Если probe упал — **не пробуй вслепую**. Зафиксируй ошибку, см. таблицу ниже, эскалируй.
+
+### Источники connectivity-данных (single source of truth)
+
+Если не уверен в IP / DNS / SSH user / ключе — **читай**, не угадывай:
+
+| Что нужно | Файл |
+|-----------|------|
+| Публичные IP, Tailscale DNS, SSH user, SSH key | [`SERVER_HOSTS.md`](../../SERVER_HOSTS.md) |
+| Сервисы / порты / DNS / systemd | [`INFRASTRUCTURE_REGISTRY.md`](../../INFRASTRUCTURE_REGISTRY.md) |
+| MCP servers (для local CLI) | [`MCP_SERVICES_REGISTRY.md`](../../MCP_SERVICES_REGISTRY.md) |
+| Токены / ротация | [`TOKEN_ROTATION.md`](../../TOKEN_ROTATION.md) |
+| Маппинг проект → сервер | [`scripts/projects.conf`](../../scripts/projects.conf) + [`SERVER_HOSTS.md`](../../SERVER_HOSTS.md) |
+| Break-glass (если Tailscale недоступен) | [`docs/BREAK_GLASS.md`](../../docs/BREAK_GLASS.md) |
+
+**Канон SSH:** primary — Tailscale MagicDNS (`*.tail0840bc.ts.net`); break-glass через публичный IP только из `BREAK_GLASS.md`. SSH user / key — из `SERVER_HOSTS.md` колонок.
+
+### Декодер ошибок
+
+Если probe / команда вернули ошибку — **что значит и что делать**:
+
+| Симптом | Причина | Действие |
+|---------|---------|----------|
+| `gh ... TLS handshake timeout` / `connection reset` | Локальный network / DPI / фильтрация GitHub | **Не повторять вслепую.** Сообщить пользователю «GitHub недоступен с этого хоста, нужен VPN/прокси». YC/Tailscale можно отдельно проверять. |
+| `ssh ... Operation timed out` на Tailscale DNS | Tailscale не запущен / нода не в tailnet / ACL запрет | `tailscale status`; если ноутбук — `sudo tailscale up`; если CI — проверить `tag:ci`/`tag:dev` в ACL. Не прыгать на публичный IP без явной break-glass необходимости. |
+| `ssh: Could not resolve hostname *.tail0840bc.ts.net` | MagicDNS не активен | `tailscale up --accept-dns=true`; если запрещено — fallback на публичный IP **только если break-glass**. |
+| `Permission denied (publickey)` на SSH | Не тот ключ / не тот user | Сверить с `SERVER_HOSTS.md` (колонки SSH user, SSH key); проверить `ssh-add -L`. |
+| `gh: Resource not accessible by integration` (403) | Неверный owner / scope token | Сверить `--repo` с org owner (`badygov-eng`) и scopes токена. |
+| `502 Bad Gateway` от прод-сервиса | Сервис лежит / контейнер restarted | Не делать второй запрос; сначала `gh run list` (CI deploy?), затем `ssh ... docker ps`, затем мониторинг. |
+| `gh run view ... no logs` | Job не залогинен / runner upload в процессе | Подождать ≤60s, если всё равно нет — открыть Actions UI вручную. |
+| Нет доступа к ВМ (нет SSH вообще) | Агент / окружение без сетевого доступа | **Эскалация**: явно сказать пользователю «нужен доступ через X», предложить альтернативу (БД read-only / monitoring / GH Actions logs / следы в логах). |
+
+### Fallback пути (по сервису)
+
+Когда primary probe failed, иди по списку:
+
+**GitHub Actions / runs:**
+1. `gh run view <id> --log-failed` (primary)
+2. `gh run download <id> --name=<artifact>` (если логов нет — артефакты)
+3. Open `https://github.com/<owner>/<repo>/actions/runs/<id>` в браузере (manual)
+4. Эскалация — пользователь делится скрином / логом
+
+**Прод main-server (logs / status):**
+1. SSH через Tailscale: `ssh deploy@main-server.tail0840bc.ts.net journalctl -u <svc> -n 200`
+2. SSH через alias `yc-vm` (тот же tailnet, см. `SERVER_HOSTS.md` § ~/.ssh/config)
+3. SSH через публичный IP **только** через `docs/BREAK_GLASS.md`
+4. Datadog / Prometheus dashboard (URL см. INFRASTRUCTURE_REGISTRY.md)
+5. Эскалация: попросить пользователя пробросить логи
+
+**Прод БД (read-only inspection):**
+1. MCP `postgres` сервер (если настроен) — see `vibe-coding-mcp.mdc` matrix
+2. SSH + `psql -h 127.0.0.1` локально на VM
+3. Эскалация — пользователь делает дамп
+
+**Никогда:** не делать `psql -h <публичный_IP>` напрямую (порт 5432 не должен быть открыт; см. `critical-guardrails.mdc` § Forbidden).
+
+### Запреты
+
+- **Не предполагать connectivity**, не повторять команду 3+ раза без новых данных.
+- **Не угадывать IP / SSH user / ключ** — читать `SERVER_HOSTS.md`.
+- **Не лезть на публичный IP** в обход Tailscale без явной break-glass причины.
+- **Не делать** `gh ... --hostname` overrides без проверки.
+- **Не тратить** время агента на цикл retry, когда нужна эскалация пользователю.
+
+### Связь с другими правилами
+
+- `critical-guardrails.mdc` § Forbidden: публичные БД, обход secret push protection.
+- `vibe-coding-mcp.mdc`: матрица «задача → MCP», когда `bash` MCP лучше прямого SSH.
+- `office-mcp-deploy.mdc`: правила для CD прод-стека.
+
+## Где живут эти решения
+
+- Этот файл (`atlas-canon.mdc`) — канон для агента в каждом промте.
+- `MCP/ATLAS.md` § Atlas-1.5 — применение канона к существующим репо (audit + migrate).
+- `MCP/templates/atlas-project/` — реализация канона для bootstrap новых проектов.
+- `MCP/docs/ADR/2026-05-04-adopt-atlas.md` — обоснование Atlas как single source of truth.
+- `MCP/docs/ADR/2026-05-06-pr-workflow-reset-canon.md` — reset + PR workflow + connectivity canon.
+
+## Изменение канона
+
+1. Открыть ADR в `MCP/docs/ADR/YYYY-MM-DD-<change>.md` с контекстом, альтернативами, последствиями.
+2. Обновить этот файл (`atlas-canon.mdc`).
+3. Обновить `templates/atlas-project/` под новые решения.
+4. Обновить `scripts/atlas/audit_project.sh` checks (Atlas-1.5) под новые правила.
+5. Прогнать audit на всех активных репо для регрессии — отчёт в `docs/AUDIT/`.
+6. Зафиксировать в `MCP/docs/DECISIONS.md`.
+
+## Связь с другими правилами
+
+- `discovery.mdc` (alwaysApply) — поиск перед написанием. Канон-сосед.
+- `pr-workflow-canon.mdc` (alwaysApply) — PR workflow: 1 чат / 1 worktree / 1 ветка / 1 PR; TBD; hot-zones.
+- `critical-guardrails.mdc` — запреты на деплой/секреты/прод. Канон поверх.
+- `vibe-coding-mcp.mdc` — матрица «задача → MCP». Канон поверх.
