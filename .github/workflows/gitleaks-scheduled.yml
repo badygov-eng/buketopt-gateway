@@ -1,0 +1,24 @@
+name: Gitleaks (scheduled)
+on:
+  schedule:
+    - cron: "30 5 * * 0" # Sundays
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - run: |
+          curl -fsSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz | tar xz -C /tmp
+          sudo install -m0755 /tmp/gitleaks /usr/local/bin/gitleaks
+      - run: gitleaks dir . --no-banner --redact --report-path gitleaks-report.json --report-format json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.json
+          retention-days: 30

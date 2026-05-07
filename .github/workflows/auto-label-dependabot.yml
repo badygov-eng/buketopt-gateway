@@ -1,0 +1,94 @@
+# Atlas canon — add auto-deploy for trusted bot PRs (pairs with auto-merge.yml)
+name: Auto-label trusted bot PRs
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, labeled]
+  check_suite:
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  auto-label-trusted-bots:
+    # Only evaluate PR payloads; check_suite is ignored (kept to mirror auto-merge triggers).
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Escape hatch, cursor, or Dependabot gate
+        id: gate
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr || pr.draft) {
+              core.setOutput('need_dependabot_fetch', 'false');
+              core.info('No PR or draft — skip');
+              return;
+            }
+
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            const opts = { owner, repo, issue_number: pr.number };
+
+            async function addAutoDeploy() {
+              const { data } = await github.rest.issues.listLabelsOnIssue(opts);
+              if (data.some((l) => l.name === 'auto-deploy')) {
+                core.info('Label auto-deploy already present');
+                return;
+              }
+              await github.rest.issues.addLabels({ ...opts, labels: ['auto-deploy'] });
+              core.info('Added label auto-deploy');
+            }
+
+            if (context.payload.action === 'labeled' && context.payload.label?.name === 'dependabot-major-ok') {
+              await addAutoDeploy();
+              core.setOutput('need_dependabot_fetch', 'false');
+              return;
+            }
+
+            const login = pr.user.login;
+            const isDependabot = login === 'dependabot[bot]' || login === 'app/dependabot';
+            const isCursor = login === 'cursor[bot]' || login === 'app/cursor';
+
+            if (!isDependabot && !isCursor) {
+              core.info(`Skipping: untrusted author ${login}`);
+              core.setOutput('need_dependabot_fetch', 'false');
+              return;
+            }
+
+            if (isCursor) {
+              await addAutoDeploy();
+              core.setOutput('need_dependabot_fetch', 'false');
+              return;
+            }
+
+            core.setOutput('need_dependabot_fetch', 'true');
+
+      - name: Fetch Dependabot metadata
+        id: metadata
+        if: steps.gate.outputs.need_dependabot_fetch == 'true'
+        uses: dependabot/fetch-metadata@21025c705c08248db411dc16f3619e6b5f9ea21a # v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Label patch/minor Dependabot updates
+        if: >-
+          steps.gate.outputs.need_dependabot_fetch == 'true' &&
+          (steps.metadata.outputs.update-type == 'version-update:semver-patch' ||
+           steps.metadata.outputs.update-type == 'version-update:semver-minor')
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            const opts = { owner, repo, issue_number: pr.number };
+            const { data } = await github.rest.issues.listLabelsOnIssue(opts);
+            if (!data.some((l) => l.name === 'auto-deploy')) {
+              await github.rest.issues.addLabels({ ...opts, labels: ['auto-deploy'] });
+            }

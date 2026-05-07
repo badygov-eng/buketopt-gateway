@@ -1,0 +1,44 @@
+# Atlas-7 — automated stale PR + branch hygiene (3 days warning, 7 days auto-close).
+# Solo-dev velocity (5-15 PR/day) means default GitHub thresholds (60d) are useless.
+# Escape hatch: label `keep-open` on PR to exempt from auto-close.
+name: Stale (Atlas-7)
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # daily 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: stale
+  cancel-in-progress: true
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/stale@5bef64f19d7facfb25b37b414482c7164d639639 # v9
+        with:
+          # PR thresholds (Atlas-7 canon)
+          days-before-pr-stale: 3
+          days-before-pr-close: 7
+          stale-pr-label: stale
+          exempt-pr-labels: "keep-open,security,blocked-on-external"
+          stale-pr-message: |
+            This PR has been inactive for 3 days. Per [Atlas-7 canon](../blob/main/.cursor/rules/atlas-canon.mdc#branch-hygiene-atlas-7) it will auto-close in 4 more days.
+            Add the `keep-open` label to exempt, or push a commit / leave a comment to reset the timer.
+          close-pr-message: |
+            Auto-closed: 7 days no activity per Atlas-7. Reopen by removing `stale` label and pushing new commits.
+          # Issues — keep default GitHub-style thresholds (issues are not in the canon)
+          days-before-issue-stale: -1
+          days-before-issue-close: -1
+          # Performance
+          operations-per-run: 100
+          ascending: true
+          remove-stale-when-updated: true
+          delete-branch: true
