@@ -1,0 +1,33 @@
+name: Snyk (warn-only)
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore: ["docs/**", "*.md"]
+  schedule:
+    - cron: "0 6 * * 2"
+permissions:
+  contents: read
+jobs:
+  snyk:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.11"
+      - uses: snyk/actions/setup@9adf32b1121593767fc3c057af55b55db032dc04
+      - name: Snyk test (warn-only)
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SNYK_TOKEN:-}" ]; then
+            echo "::notice::SNYK_TOKEN not set — skipping Snyk"
+            exit 0
+          fi
+          python -m pip install --upgrade pip
+          if [[ -f requirements.txt ]]; then
+            python -m pip install -r requirements.txt || true
+          fi
+          snyk test --all-projects --severity-threshold=high || true
