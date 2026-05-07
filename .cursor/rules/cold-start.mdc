@@ -1,0 +1,12 @@
+---
+description: Cold start — как ориентироваться в репо за 5 минут
+alwaysApply: true
+---
+
+Если ты не знаешь, как устроен этот репо, читай в порядке:
+
+1. `AGENTS.md` — обзор, cold-start канон.
+2. `docs/INDEX.md` — каталог документации.
+3. `docs/ADR/` — принятые архитектурные решения.
+4. `docs/MIGRATIONS/` — playbooks (завершённые: `docs/MIGRATIONS/completed/`).
+5. MCP `REPOS_INDEX.md` — соседи по экосистеме (Atlas-2.2).

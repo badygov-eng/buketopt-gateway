@@ -1,0 +1,185 @@
+---
+description: PR workflow canon — 1 chat = 1 worktree = 1 branch = 1 PR; TBD; hot-zones; restart workflow
+alwaysApply: true
+---
+
+# PR workflow canon
+
+> Source of truth для агента **в каждом промте**. Принят 2026-05-06 после reset-инцидента (16 open PR, перепутанные ветки, stacked PR без причины, agents не знали в каком они рабочем дереве).
+>
+> ADR: [`MCP/docs/ADR/2026-05-06-pr-workflow-reset-canon.md`](../../docs/ADR/2026-05-06-pr-workflow-reset-canon.md)
+
+## Принципы (нерушимые)
+
+### 1. Один диалог = один worktree = одна ветка = один PR
+
+- **Один Cursor чат** → работает в **одном рабочем каталоге** (worktree) → одна **активная ветка** → ровно **один открытый PR** на эту ветку.
+- Не открывать новый чат на ту же ветку. Не открывать вторую ветку из того же чата.
+- Cursor **не знает** про ветку чата — агент каждый раз заново смотрит `git status`. **Правильное состояние = правильное worktree.**
+
+### 1a. Запрет direct push на main
+
+**ВСЕ изменения main идут только через PR.** Direct `git push origin main` запрещён без исключений (даже для admin / owner).
+
+С 2026-05-07 включён `enforce_admins=true` через `scripts/atlas/branch_protection_apply.sh` — direct push блокируется на server-side.
+
+**Если очень нужен direct push** (emergency rollback / restore from snapshot) → читай [`docs/PLAYBOOKS/break-glass-direct-push.md`](../../docs/PLAYBOOKS/break-glass-direct-push.md) — есть документированная процедура с временным disable + post-mortem требованием.
+
+### 1b. Subagent ОБЯЗАН проверить ACTIVE_WORK.md перед открытием PR
+
+При запуске любого subagent на Atlas задачу (W*-D*-*) **первый шаг** — проверка дублирующихся PR:
+
+```bash
+# 1. Read ACTIVE_WORK.md — есть ли уже активный PR на ту же зону?
+# 2. gh pr list --repo badygov/MCP --state open --search "in:title <atlas-id>"
+# 3. Если есть конфликтующий PR — НЕ открывать новый, дополнить существующий или сообщить блокер.
+```
+
+Это правило обязательно для **всех subagent prompts** запускаемых через `Task` tool (composer-2-fast и пр.). Иначе параллельные сессии будут создавать дублирующиеся PR'ы (что произошло W7-D3 — #430+#435, #431+#434, #432+#433).
+
+### 2. TBD (Trunk-Based Development)
+
+- **PR ≤ 300 LoC** (changed lines). Больше — split. Исключение только с явным `keep-open` лейблом + комментом-обоснованием.
+- **PR живёт ≤ 3 дня**. Дольше — либо split, либо close + переоткрыть от свежего main.
+- **`base = main` всегда**. Stacked PR (`base = feature-branch`) — запрещены. Если фича большая — split на независимые PR на main.
+
+### 3. Hot-zone awareness
+
+Эти файлы **критические** — параллельная работа двух PR гарантирует merge conflict:
+
+```
+office-mcp-servers/config/profile-mapping.json
+office-mcp-servers/docker-compose.yml
+office-mcp-servers/docker-compose.profile.*.yml
+office-mcp-servers/.cache/profile-mapping.generated.json
+shared/credentials/**
+shared/profile_runtime.py
+openclaw-agents/scripts/generator/compose.py
+openclaw-agents/configs/base.jsonc
+office-mcp-servers/config/catalog/servers/*.json
+REPOS_INDEX.md
+```
+
+**Перед** касанием hot-zone файла:
+1. Проверь [`MCP/ACTIVE_WORK.md`](../../ACTIVE_WORK.md) — нет ли другого PR в той же зоне.
+2. Если есть — спроси пользователя: ждать merge / координировать.
+3. Зарегистрируй свой PR в `ACTIVE_WORK.md`.
+
+### 4. Generated files **никогда** не в feature branch
+
+- Полный список — [`scripts/atlas/generated_files.txt`](../../scripts/atlas/generated_files.txt) (single source of truth).
+- Feature branch меняет **источники** (`catalog/`, `base.jsonc`, `docs/**`).
+- Регенерация на main — отдельным bot/CI workflow:
+  - `canon_baseline.json` → `atlas-baseline-regen-bot.yml` (Atlas Day-72)
+  - `profile-mapping.json` → `office-mcp-digest-pin-bot.yml`
+  - `docker-compose*.yml` → `office-mcp-compose-sync.yml`
+- **Pre-commit hook `block-generated-files`** блокирует коммит generated на feature branch (Atlas Day-72, активен с 2026-05-07).
+- Break-glass: `ATLAS_ALLOW_GENERATED_EDIT=1 git commit ...` — только для bot'а или документированного инцидента.
+
+### 5. Backup перед массовым закрытием
+
+Перед `gh pr close --delete-branch`:
+
+```bash
+git fetch origin
+git tag -a "backup/pr<N>-<safe-branch>-YYYY-MM-DD" -m "..." "origin/<branch>"
+git push origin "backup/pr<N>-<safe-branch>-YYYY-MM-DD"
+```
+
+Тег указывает на коммит, выживает удаление ветки. Восстановление:
+
+```bash
+git checkout -b feat/<new> backup/pr<N>-<branch>-YYYY-MM-DD
+```
+
+### 6. Запрет stacked / shared head branch
+
+- Не использовать одну ветку как head для двух PR с разными базами.
+- Не использовать `base = другая-feature-ветка`.
+- Это путаница, которой нельзя позволять.
+
+### 7. Conflict-resolver canon (Atlas Day-72)
+
+Конфликты между параллельными PR — решаются **архитектурно**, не вручную.
+
+**3 слоя защиты** (см. ADR [`2026-05-day-72-conflict-resolver-canon.md`](../../docs/ADR/2026-05-day-72-conflict-resolver-canon.md)):
+
+1. **Architectural** — generated files регенерируются bot'ами на main, никогда в feature branch (см. § 4).
+2. **Prevention** — pre-commit hook `block-generated-files` (читает [`scripts/atlas/generated_files.txt`](../../scripts/atlas/generated_files.txt)) блокирует ручные правки.
+3. **Reactive** — `conflict-resolver-bot.yml` каждые 10 мин детектит DIRTY PR с label `auto-deploy` и пытается auto-resolve known patterns:
+   - `canon_baseline.json` → re-run `audit_docs_canon.py --update-baseline`
+   - `ACTIVE_WORK.md` → keep both sides (concat sections by PR ID)
+   - other → comment в PR, label `needs-manual-resolve`
+
+**Subagent МАНДАТ:** при работе на параллельных задачах — **никогда** не редактируй файлы из `generated_files.txt`. Если pre-commit упал на этот hook — discard local edit и продолжай работу. Bot регенерирует на main после merge.
+
+См. [`docs/PLAYBOOKS/conflict-resolution-canon.md`](../../docs/PLAYBOOKS/conflict-resolution-canon.md) для подробностей.
+
+## Restart workflow (когда чат сошёл с рельс)
+
+Если в текущем чате запутались ветки / висят 2+ PR / тестируется чужой код:
+
+```bash
+# 1. бэкап текущей ветки если есть незавершённое
+git tag -a "backup/wip-$(date +%Y-%m-%d)-$RANDOM" -m "WIP backup before reset" HEAD
+git push origin --tags 2>/dev/null
+
+# 2. вернуться на свежий main
+git fetch origin --prune
+git checkout main
+git pull --ff-only
+
+# 3. создать новый worktree для текущей задачи
+cd /Users/danielbadygov
+git -C MCP worktree add MCP-<task> -b feat/<task> origin/main
+
+# 4. открыть в Cursor: File → Open Folder → MCP-<task>
+# 5. начать новый чат в этом окне
+```
+
+После merge или close PR:
+
+```bash
+git -C MCP worktree remove MCP-<task>
+git -C MCP branch -D feat/<task>  # если локально остался
+```
+
+## ACTIVE_WORK.md — живой реестр
+
+[`MCP/ACTIVE_WORK.md`](../../ACTIVE_WORK.md) — текущие активные ветки/PR/чаты. Обновляется:
+- В **начале** работы над веткой (добавить строку).
+- При **смене статуса** (merged / closed / stuck).
+- В **конце дня** — review всех записей (всё ли актуально?).
+
+Каждая запись:
+- branch
+- worktree path
+- зона (yandex / loyalty / openclaw / docs / …)
+- hot-zone files touched
+- статус (WIP / review / merging / blocked-on-X)
+- chat name (если применимо)
+
+## Чек-лист перед открытием PR
+
+1. ✅ Ветка от свежего `origin/main` (не stacked).
+2. ✅ ≤ 300 LoC изменений.
+3. ✅ Не трогаем generated files (см. §4).
+4. ✅ Hot-zone files: координация в `ACTIVE_WORK.md`.
+5. ✅ Title — conventional commit (`feat:` / `fix:` / `chore:` / `docs:`).
+6. ✅ Description — ссылка на issue/ADR/discovery-report.
+7. ✅ `gh pr create --base main --head feat/<task>`.
+
+## Чек-лист перед merge PR
+
+1. ✅ Все обязательные CI checks **зелёные** (не BLOCKED).
+2. ✅ Если затронут hot-zone — ещё раз проверить, что нет open PR с overlap.
+3. ✅ `gh pr merge <N> --squash --delete-branch`.
+4. ✅ Удалить worktree локально + ветку.
+5. ✅ Обновить `ACTIVE_WORK.md` — статус "merged".
+
+## Связь с другими правилами
+
+- [`atlas-canon.mdc`](atlas-canon.mdc) — общий канон Atlas + connectivity.
+- [`discovery.mdc`](discovery.mdc) — поиск перед написанием.
+- [`critical-guardrails.mdc`](critical-guardrails.mdc) — запреты деплоя/секретов.
+- [`vibe-coding-mcp.mdc`](vibe-coding-mcp.mdc) — матрица «задача → MCP».

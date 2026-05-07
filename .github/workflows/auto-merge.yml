@@ -1,0 +1,183 @@
+# Atlas Day-57 — auto-merge for pre-approved PRs (label + branch protection)
+name: Auto-merge pre-approved PRs
+
+on:
+  pull_request_target:
+    types: [labeled, synchronize, reopened]
+  check_suite:
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  auto-merge-pre-approved:
+    name: auto-merge-pre-approved
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      github.event_name == 'check_suite'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      checks: read
+      actions: read
+    steps:
+      - name: Resolve PR number (check_suite fallback when pull_requests is empty)
+        id: resolve_pr
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            if (context.eventName === 'pull_request_target') {
+              const pr = context.payload.pull_request;
+              if (!pr || pr.number == null) {
+                core.setOutput('pr_number', '');
+                return;
+              }
+              core.setOutput('pr_number', String(pr.number));
+              return;
+            }
+            if (context.eventName === 'check_suite') {
+              const cs = context.payload.check_suite;
+              if (!cs) {
+                core.setOutput('pr_number', '');
+                return;
+              }
+              const linked = cs.pull_requests || [];
+              if (linked.length > 0) {
+                core.setOutput('pr_number', String(linked[0].number));
+                return;
+              }
+              const headSha = cs.head_sha;
+              if (!headSha) {
+                core.setOutput('pr_number', '');
+                return;
+              }
+              const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+              const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner,
+                repo,
+                commit_sha: headSha,
+              });
+              const open = data.filter((p) => p.state === 'open');
+              core.setOutput('pr_number', open.length ? String(open[0].number) : '');
+              return;
+            }
+            core.setOutput('pr_number', '');
+
+      - name: Queue squash auto-merge when labels + policy allow
+        # checkov:skip=CKV_GHA_2: PR metadata from GITHUB_EVENT / gh JSON only; no user-controlled shell interpolation.
+        #
+        # ВАЖНО: используем AUTO_MERGE_PAT (Personal Access Token), а не GITHUB_TOKEN.
+        # GitHub намеренно НЕ запускает workflow runs для events от GITHUB_TOKEN bot
+        # (защита от рекурсии: docs.github.com/en/actions/security-guides/automatic-token-authentication).
+        # Без PAT push:main и pull_request_target.closed events не фаерят downstream workflows
+        # (включая auto-deploy-trigger, MCP CI на main, и т.д.).
+        # Fallback на GITHUB_TOKEN если PAT не задан — чтобы workflow не сломался при ротации.
+        # См. docs/AUDIT/2026-05-day-69-github-token-recursion.md.
+        env:
+          GH_TOKEN: ${{ secrets.AUTO_MERGE_PAT || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          PR="${{ steps.resolve_pr.outputs.pr_number }}"
+          if [ -z "${PR}" ]; then
+            echo "No PR resolved — skip"
+            exit 0
+          fi
+
+          BASE_REF=$(gh pr view "${PR}" --repo "${REPO}" --json baseRefName -q .baseRefName)
+          if [ "$(gh pr view "${PR}" --repo "${REPO}" --json isDraft -q .isDraft)" = "true" ]; then
+            echo "Draft PR — skip"
+            exit 0
+          fi
+
+          if [ "${BASE_REF}" != "main" ]; then
+            echo "baseRef=${BASE_REF} — only main is auto-merge eligible"
+            exit 0
+          fi
+
+          echo "Evaluating PR #${PR} for pre-approval auto-merge"
+
+          block_labels=$(gh pr view "${PR}" --repo "${REPO}" --json labels -q '
+            [.labels[].name] as $n
+            | ($n | any(. == "hold" or . == "do-not-merge" or . == "merge-blocked"))
+          ')
+          if [ "${block_labels}" = "true" ]; then
+            echo "Blocking convention label present — skip"
+            exit 0
+          fi
+
+          has_preapproval=$(gh pr view "${PR}" --repo "${REPO}" --json labels -q '
+            [.labels[].name] as $n
+            | ($n | any(. == "auto-deploy" or . == "auto-deploy-migration" or . == "destructive-ok"))
+          ')
+          if [ "${has_preapproval}" != "true" ]; then
+            echo "No pre-approval deploy label — skip"
+            exit 0
+          fi
+
+          rd=$(gh pr view "${PR}" --repo "${REPO}" --json reviewDecision -q .reviewDecision)
+          if [ "${rd}" = "CHANGES_REQUESTED" ]; then
+            echo "reviewDecision=CHANGES_REQUESTED — skip"
+            exit 0
+          fi
+
+          req_changes=$(gh pr view "${PR}" --repo "${REPO}" --json reviews -q '
+            [.reviews[] | select(.state == "CHANGES_REQUESTED")] | length
+          ')
+          if [ "${req_changes}" != "0" ]; then
+            echo "Outstanding CHANGES_REQUESTED reviews — skip"
+            exit 0
+          fi
+
+          blocking_cmt=$(gh api "repos/${REPO}/issues/${PR}/comments" --paginate --jq \
+            '[.[] | select(.body != null and ((.body | contains("[BLOCK_MERGE]")) or (.body | contains("!BLOCK_MERGE")) or (.body | ascii_downcase | contains("/block-merge")) or (.body | ascii_downcase | contains("/block_merge"))))] | length')
+          if [ "${blocking_cmt}" != "0" ]; then
+            echo "Blocking merge comment marker present — skip"
+            exit 0
+          fi
+
+          mergeable=$(gh pr view "${PR}" --repo "${REPO}" --json mergeable -q .mergeable)
+          merge_state=$(gh pr view "${PR}" --repo "${REPO}" --json mergeStateStatus -q .mergeStateStatus)
+
+          if [ "${mergeable}" != "MERGEABLE" ]; then
+            echo "mergeable=${mergeable} — skip"
+            exit 0
+          fi
+
+          # DIRTY = real conflicts, no-go.
+          # BLOCKED = required checks not yet green; gh pr merge --auto will queue and merge later.
+          # BEHIND = branch behind main; gh pr merge --auto will auto-update + merge if repo allows it,
+          #         otherwise next labeled/check_suite event will retry post update-branch.
+          # CLEAN/UNSTABLE/HAS_HOOKS = green path.
+          case "${merge_state}" in
+            DIRTY)
+              echo "mergeStateStatus=${merge_state} — real conflicts; skip"
+              exit 0
+              ;;
+          esac
+
+          echo "Queueing auto-merge (squash, delete branch); current state=${merge_state}"
+          if ! gh pr merge "${PR}" --repo "${REPO}" --auto --squash --delete-branch; then
+            echo "gh pr merge failed or already queued — ok"
+          fi
+
+          # Force update-branch when BEHIND. GitHub auto-merge does NOT auto-update by default
+          # (requires repo setting + branch protection 'require branch up to date'), and we cannot
+          # rely on those alone for solo-dev velocity. Explicit nudge:
+          #
+          # IMPORTANT: use PLAIN merge (not --rebase). Rebase via GitHub API has a known race
+          # where the resulting force-push doesn't reliably fire the `pull_request: synchronize`
+          # event, so required CI checks never run on the new head and the PR sits BLOCKED forever.
+          # Plain merge creates a normal merge commit which always fires synchronize → CI runs →
+          # auto-merge fires. We pay a tiny cost in history shape (one extra merge commit per
+          # update); since we squash-merge into main anyway, the merge commit is collapsed.
+          # See AUDIT/2026-05-day-69-rebase-race.md (W7 day-1 hot-fix).
+          if [ "${merge_state}" = "BEHIND" ]; then
+            echo "Branch BEHIND — issuing update-branch (merge) so CI re-runs and auto-merge can fire"
+            gh pr update-branch "${PR}" --repo "${REPO}" || \
+              echo "update-branch failed (likely conflict) — auto-merge will retry on next event"
+          fi
